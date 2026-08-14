@@ -1,0 +1,127 @@
+# =============================================================================
+# Rocket.Chat + MongoDB + Cloudflared Tunnel
+#
+# Deploy:
+#   docker compose -f Rocket.Chat/docker-compose.yml --env-file Rocket.Chat/.env up -d
+#
+# MongoDB runs as a replica set (required by Rocket.Chat for oplog tailing).
+# Valkey (Redis-compatible) is used from the existing kikaiworks infrastructure.
+# Cloudflared tunnel exposes Rocket.Chat at chat.kikaiworks.com
+# =============================================================================
+
+services:
+  # ==============================
+  # MongoDB — Replica Set (required by Rocket.Chat)
+  # ==============================
+  mongo:
+    image: mongodb/mongodb-community-server:${MONGODB_VERSION:-8.0}-ubi8
+    container_name: kikaiworks_rocketchat_mongo
+    restart: unless-stopped
+    environment:
+      MONGODB_REPLICA_SET_NAME: ${MONGODB_REPLICA_SET_NAME:-rs0}
+      MONGODB_PORT_NUMBER: 27017
+      MONGODB_INITIAL_PRIMARY_HOST: mongo
+    entrypoint:
+      - bash
+      - -c
+      - |
+        mongod --replSet $${MONGODB_REPLICA_SET_NAME} --bind_ip_all &
+        sleep 2
+        until mongosh --quiet --eval "db.adminCommand('ping')" > /dev/null 2>&1; do
+          echo '=====> Waiting for MongoDB...'
+          sleep 1
+        done
+        echo "=====> Initiating Replica Set $${MONGODB_REPLICA_SET_NAME}..."
+        mongosh --quiet --eval "try { rs.status() } catch(e) { rs.initiate({_id: '$${MONGODB_REPLICA_SET_NAME}', members: [{ _id: 0, host: '$${MONGODB_INITIAL_PRIMARY_HOST}:$${MONGODB_PORT_NUMBER}' }]}) }"
+        echo '=====> MongoDB ready.'
+        wait
+    volumes:
+      - rocketchat_mongo_data:/data/db
+      - rocketchat_mongo_config:/data/configdb
+    networks:
+      - rocketchat-net
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "mongosh",
+          "--quiet",
+          "--eval",
+          "db.adminCommand('ping').ok"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 40s
+
+  # ==============================
+  # Rocket.Chat Application
+  # ==============================
+  rocketchat:
+    image: ${ROCKETCHAT_IMAGE:-registry.rocket.chat/rocketchat/rocket.chat:8.6.1}
+    container_name: kikaiworks_rocketchat
+    restart: unless-stopped
+    environment:
+      # --- MongoDB Connection ---
+      MONGO_URL: mongodb://mongo:27017/rocketchat?replicaSet=${MONGODB_REPLICA_SET_NAME:-rs0}
+      MONGO_OPLOG_URL: mongodb://mongo:27017/local?replicaSet=${MONGODB_REPLICA_SET_NAME:-rs0}
+
+      # --- Valkey (Redis-compatible) ---
+      REDIS_URL: redis://:${VALKEY_PASSWORD}@${VALKEY_HOST}:${VALKEY_PORT}
+
+      # --- General ---
+      ROOT_URL: https://chat.kikaiworks.com
+      PORT: 3000
+      OVERWRITE_SETTING_Show_Setup_Wizard: completed
+      ROCKETCHAT_LICENSE: ""
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - rocketchat-net
+      - kikaiworks-net
+    depends_on:
+      mongo:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--no-verbose",
+          "--tries=1",
+          "--spider",
+          "http://127.0.0.1:3000/livez"
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # ==============================
+  # Cloudflared Tunnel — chat.kikaiworks.com
+  # ==============================
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: kikaiworks_rocketchat_cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN}
+    network_mode: "service:rocketchat"
+    depends_on:
+      rocketchat:
+        condition: service_healthy
+
+volumes:
+  rocketchat_mongo_data:
+    name: rocketchat_mongo_data
+  rocketchat_mongo_config:
+    name: rocketchat_mongo_config
+
+networks:
+  rocketchat-net:
+    name: rocketchat-net
+    driver: bridge
+  kikaiworks-net:
+    external: true
+    name: kikaiworks-net
